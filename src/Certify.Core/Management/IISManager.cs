@@ -14,13 +14,29 @@ namespace Certify.Management
     /// <summary>
     /// Model to work with IIS site details.
     /// </summary>
-
     public class IISManager
     {
         #region IIS
 
         // private readonly bool _showOnlyStartedWebsites = Properties.Settings.Default.ShowOnlyStartedWebsites;
         private readonly IdnMapping _idnMapping = new IdnMapping();
+
+        private bool _isIISAvailable { get; set; }
+
+        public bool IsIISAvailable
+        {
+            get
+            {
+                if (!_isIISAvailable)
+                {
+                    var srv = GetDefaultServerManager();
+                    // _isIISAvaillable will be updated by query against server manager
+                    if (srv != null) return _isIISAvailable;
+                }
+
+                return _isIISAvailable;
+            }
+        }
 
         public Version GetIisVersion()
         {
@@ -29,6 +45,8 @@ namespace Certify.Management
             {
                 if (componentsKey != null)
                 {
+                    _isIISAvailable = true;
+
                     int majorVersion = (int)componentsKey.GetValue("MajorVersion", -1);
                     int minorVersion = (int)componentsKey.GetValue("MinorVersion", -1);
 
@@ -44,30 +62,66 @@ namespace Certify.Management
 
         private ServerManager GetDefaultServerManager()
         {
-            return new ServerManager(); //(@"C:\Windows\System32\inetsrv\config\applicationHost.config"
+            ServerManager srv = null;
+            try
+            {
+                srv = new ServerManager();
+            }
+            catch (System.Runtime.InteropServices.COMException)
+            {
+                try
+                {
+                    srv = new ServerManager(@"C:\Windows\System32\inetsrv\config\applicationHost.config");
+                }
+                catch (Exception)
+                {
+                    // IIS is probably not installed
+                }
+            }
+
+            _isIISAvailable = false;
+            if (srv != null)
+            {
+                //check iis version
+                var v = GetIisVersion();
+                if (v.Major < 7)
+                {
+                    _isIISAvailable = false;
+                }
+            }
+            // may be null if could not create server manager
+            return srv;
         }
 
         public IEnumerable<Site> GetSites(ServerManager iisManager, bool includeOnlyStartedSites)
         {
-            if (includeOnlyStartedSites)
+            try
             {
-                //s.State may throw a com exception for sites in an invalid state.
-
-                return iisManager.Sites.Where(s =>
+                if (includeOnlyStartedSites)
                 {
-                    try
+                    //s.State may throw a com exception for sites in an invalid state.
+
+                    return iisManager.Sites.Where(s =>
                     {
-                        return s.State == ObjectState.Started;
-                    }
-                    catch (Exception)
-                    {
-                        return false;
-                    }
-                });
+                        try
+                        {
+                            return s.State == ObjectState.Started;
+                        }
+                        catch (Exception)
+                        {
+                            return false;
+                        }
+                    });
+                }
+                else
+                {
+                    return iisManager.Sites;
+                }
             }
-            else
+            catch (Exception)
             {
-                return iisManager.Sites;
+                //failed to enumerate sites
+                return new List<Site>();
             }
         }
 
@@ -82,30 +136,33 @@ namespace Certify.Management
 
             using (var iisManager = GetDefaultServerManager())
             {
-                var sites = GetSites(iisManager, includeOnlyStartedSites);
-
-                foreach (var site in sites)
+                if (iisManager != null)
                 {
-                    if (site != null)
+                    var sites = GetSites(iisManager, includeOnlyStartedSites);
+
+                    foreach (var site in sites)
                     {
-                        var b = new SiteBindingItem()
+                        if (site != null)
                         {
-                            SiteId = site.Id.ToString(),
-                            SiteName = site.Name
-                        };
+                            var b = new SiteBindingItem()
+                            {
+                                SiteId = site.Id.ToString(),
+                                SiteName = site.Name
+                            };
 
-                        b.PhysicalPath = site.Applications["/"].VirtualDirectories["/"].PhysicalPath;
+                            b.PhysicalPath = site.Applications["/"].VirtualDirectories["/"].PhysicalPath;
 
-                        try
-                        {
-                            b.IsEnabled = (site.State == ObjectState.Started);
+                            try
+                            {
+                                b.IsEnabled = (site.State == ObjectState.Started);
+                            }
+                            catch (Exception)
+                            {
+                                System.Diagnostics.Debug.WriteLine("Exception reading IIS Site state value:" + site.Name);
+                            }
+
+                            result.Add(b);
                         }
-                        catch (Exception exp)
-                        {
-                            System.Diagnostics.Debug.WriteLine("Exception reading IIS Site state value:" + site.Name);
-                        }
-
-                        result.Add(b);
                     }
                 }
             }
@@ -118,9 +175,9 @@ namespace Certify.Management
             using (var iisManager = GetDefaultServerManager())
             {
                 var site = iisManager.Sites.FirstOrDefault(s => s.Id == long.Parse(siteId));
-                foreach(var d in domains)
+                foreach (var d in domains)
                 {
-                    site.Bindings.Add("*:80:" + d,"http");
+                    site.Bindings.Add("*:80:" + d, "http");
                 }
                 iisManager.CommitChanges();
             }
@@ -132,25 +189,38 @@ namespace Certify.Management
 
             using (var iisManager = GetDefaultServerManager())
             {
-                var sites = GetSites(iisManager, ignoreStoppedSites);
-
-                if (siteId != null) sites = sites.Where(s => s.Id.ToString() == siteId);
-                foreach (var site in sites)
+                if (iisManager != null)
                 {
-                    foreach (var binding in site.Bindings.OrderByDescending(b => b?.EndPoint?.Port))
-                    {
-                        var bindingDetails = GetSiteBinding(site, binding);
+                    var sites = GetSites(iisManager, ignoreStoppedSites);
 
-                        //ignore bindings which are not http or https
-                        if (bindingDetails.Protocol?.ToLower().StartsWith("http") == true)
+                    if (siteId != null) sites = sites.Where(s => s.Id.ToString() == siteId);
+                    foreach (var site in sites)
+                    {
+                        foreach (var binding in site.Bindings.OrderByDescending(b => b?.EndPoint?.Port))
                         {
-                            result.Add(bindingDetails);
+                            var bindingDetails = GetSiteBinding(site, binding);
+
+                            //ignore bindings which are not http or https
+                            if (bindingDetails.Protocol?.ToLower().StartsWith("http") == true)
+                            {
+                                result.Add(bindingDetails);
+                            }
                         }
                     }
                 }
             }
 
             return result.OrderBy(r => r.SiteName).ToList();
+        }
+
+        public string GetSitePhysicalPath(ManagedSite managedSite)
+        {
+            return GetSitePhysicalPath(FindManagedSite(managedSite));
+        }
+
+        private string GetSitePhysicalPath(Site site)
+        {
+            return site?.Applications["/"].VirtualDirectories["/"].PhysicalPath;
         }
 
         private SiteBindingItem GetSiteBinding(Site site, Binding binding)
@@ -161,7 +231,7 @@ namespace Certify.Management
                 SiteName = site.Name,
                 Host = binding.Host,
                 IP = binding.EndPoint?.Address?.ToString(),
-                PhysicalPath = site.Applications["/"].VirtualDirectories["/"].PhysicalPath,
+                PhysicalPath = GetSitePhysicalPath(site),
                 Port = binding.EndPoint?.Port,
                 IsHTTPS = binding.Protocol.ToLower() == "https",
                 Protocol = binding.Protocol,
@@ -266,6 +336,15 @@ namespace Certify.Management
             }
         }
 
+        public Site GetSiteById(string id)
+        {
+            using (var iisManager = GetDefaultServerManager())
+            {
+                Site siteDetails = iisManager.Sites.FirstOrDefault(s => s.Id.ToString() == id);
+                return siteDetails;
+            }
+        }
+
         public bool IsSiteRunning(string id)
         {
             using (var iisManager = GetDefaultServerManager())
@@ -287,6 +366,41 @@ namespace Certify.Management
 
         #region Certificates
 
+        internal static void LogMessage(string managedSiteId, string msg)
+        {
+            ManagedSiteLog.AppendLog(managedSiteId, new ManagedSiteLogItem
+            {
+                EventDate = DateTime.UtcNow,
+                LogItemType = LogItemType.GeneralInfo,
+                Message = msg
+            });
+        }
+
+        /// <summary>
+        /// Finds the IIS <see cref="Site"/> corresponding to a <see cref="ManagedSite"/>.
+        /// </summary>
+        /// <param name="managedSite">Configured site.</param>
+        /// <returns>The matching IIS Site if found, otherwise null.</returns>
+        private Site FindManagedSite(ManagedSite managedSite)
+        {
+            if (managedSite == null)
+                throw new ArgumentNullException(nameof(managedSite));
+
+            var site = GetSiteById(managedSite.GroupId);
+
+            if (site != null)
+            {
+                //TODO: check site has bindings for given domains, otherwise set back to null
+            }
+
+            if (site == null)
+            {
+                site = GetSiteByDomain(managedSite.RequestConfig.PrimaryDomain);
+            }
+
+            return site;
+        }
+
         /// <summary>
         /// Creates or updates the htttps bindings associated with the dns names in the current
         /// request config, using the requested port/ips or autobinding
@@ -295,8 +409,10 @@ namespace Certify.Management
         /// <param name="pfxPath"></param>
         /// <param name="cleanupCertStore"></param>
         /// <returns></returns>
-        internal bool InstallCertForRequest(CertRequestConfig requestConfig, string pfxPath, bool cleanupCertStore)
+        internal bool InstallCertForRequest(ManagedSite managedSite, string pfxPath, bool cleanupCertStore)
         {
+            var requestConfig = managedSite.RequestConfig;
+
             if (new System.IO.FileInfo(pfxPath).Length == 0)
             {
                 throw new ArgumentException("InstallCertForRequest: Invalid PFX File");
@@ -307,31 +423,32 @@ namespace Certify.Management
 
             if (storedCert != null)
             {
+                var site = FindManagedSite(managedSite);
+
+                //get list of domains we need to create/update https bindings for
                 List<string> dnsHosts = new List<string> { requestConfig.PrimaryDomain };
-                if (requestConfig.SubjectAlternativeNames != null) dnsHosts.AddRange(requestConfig.SubjectAlternativeNames);
+                if (requestConfig.SubjectAlternativeNames != null)
+                {
+                    dnsHosts.AddRange(requestConfig.SubjectAlternativeNames);
+                }
+
                 dnsHosts = dnsHosts.Distinct().ToList();
 
+                // add/update required bindings for each dns hostname
                 foreach (var hostname in dnsHosts)
                 {
                     //match dns host to IIS site
-                    var site = GetSiteByDomain(hostname);
+                    if (String.IsNullOrWhiteSpace(hostname)) throw new ArgumentException("InstallCertForRequest: Invalid (empty) DNS hostname supplied");
+
                     if (site != null)
                     {
                         //create/update binding and associate new cert
-                        if (!requestConfig.PerformAutomatedCertBinding)
-                        {
-                            //create auto binding and use SNI
-                            InstallCertificateforBinding(site, storedCert, hostname);
-                        }
-                        else
-                        {
-                            //if any binding elements configured, use those, otherwise auto bind using defaults and SNI
-                            InstallCertificateforBinding(site, storedCert, hostname,
-                                sslPort: !String.IsNullOrEmpty(requestConfig.BindingPort) ? int.Parse(requestConfig.BindingPort) : 443,
-                                useSNI: (requestConfig.BindingUseSNI != null ? (bool)requestConfig.BindingUseSNI : true),
-                                ipAddress: requestConfig.BindingIPAddress
-                                );
-                        }
+                        //if any binding elements configured, use those, otherwise auto bind using defaults and SNI
+                        InstallCertificateforBinding(site, storedCert, hostname,
+                            sslPort: !String.IsNullOrWhiteSpace(requestConfig.BindingPort) ? int.Parse(requestConfig.BindingPort) : 443,
+                            useSNI: (requestConfig.BindingUseSNI != null ? (bool)requestConfig.BindingUseSNI : true),
+                            ipAddress: !String.IsNullOrWhiteSpace(requestConfig.BindingIPAddress) ? requestConfig.BindingIPAddress : null
+                            );
                     }
                 }
 
@@ -365,10 +482,16 @@ namespace Certify.Management
             store.Open(OpenFlags.OpenExistingOnly | OpenFlags.ReadWrite);
             using (var iisManager = GetDefaultServerManager())
             {
+                if (GetIisVersion().Major < 8)
+                {
+                    // IIS ver < 8 doesn't support SNI - default to host/SNI-less bindings
+                    useSNI = false;
+                    host = "";
+                }
                 var siteToUpdate = iisManager.Sites.FirstOrDefault(s => s.Id == site.Id);
                 if (siteToUpdate != null)
                 {
-                    string internationalHost = _idnMapping.GetUnicode(host);
+                    string internationalHost = host == "" ? "" : _idnMapping.GetUnicode(host);
                     var existingBinding = (from b in siteToUpdate.Bindings where b.Host == internationalHost && b.Protocol == "https" select b).FirstOrDefault();
 
                     if (existingBinding != null)
@@ -380,7 +503,7 @@ namespace Certify.Management
                     else
                     {
                         //add new https binding at default port "<ip>:port:hostDnsName";
-                        string bindingSpec = (ipAddress != null ? ipAddress : "") +
+                        string bindingSpec = (ipAddress != null ? ipAddress : "*") +
                             ":" + sslPort + ":" + internationalHost;
                         var iisBinding = siteToUpdate.Bindings.Add(bindingSpec, certificate.GetCertHash(), store.Name);
 

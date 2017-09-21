@@ -3,6 +3,7 @@ using ACMESharp.Vault.Model;
 using ACMESharp.Vault.Providers;
 using ACMESharp.Vault.Util;
 using Certify.ACMESharpCompat;
+using Certify.Management;
 using Certify.Models;
 using Newtonsoft.Json;
 using System;
@@ -81,6 +82,29 @@ namespace Certify
             }
         }
 
+        private void OpenVaultStorage(ACMESharp.Vault.IVault vlt, bool initOrOpen)
+        {
+            // vault store can have IO access errors due to AV products scanning files while we want
+            // to use them, retry failed open attempts
+            int maxAttempts = 3;
+            while (maxAttempts > 0)
+            {
+                try
+                {
+                    vlt.OpenStorage(initOrOpen: initOrOpen);
+                    return;
+                }
+                catch (System.IO.IOException)
+                {
+                    maxAttempts--;
+#if DEBUG
+                    System.Diagnostics.Debug.WriteLine("Failed to open vault, retrying..");
+#endif
+                    Thread.Sleep(200);
+                }
+            }
+        }
+
         public bool InitVault(bool staging = true)
         {
             string apiURI = ACMESharpUtils.WELL_KNOWN_BASE_SERVICES[ACMESharpUtils.WELL_KNOWN_LESTAGE];
@@ -95,7 +119,7 @@ namespace Certify
             {
                 using (var vlt = ACMESharpUtils.GetVault(this.vaultProfile))
                 {
-                    vlt.OpenStorage(true);
+                    OpenVaultStorage(vlt, true);
                     var v = vlt.LoadVault(false);
                     if (v != null) vaultExists = true;
                 }
@@ -115,7 +139,7 @@ namespace Certify
                     {
                         this.LogAction("InitVault", "Creating Vault");
 
-                        vlt.OpenStorage(initOrOpen: true);
+                        OpenVaultStorage(vlt, true);
 
                         var v = new VaultInfo
                         {
@@ -158,7 +182,7 @@ namespace Certify
             {
                 using (var vlt = ACMESharpUtils.GetVault(this.vaultProfile))
                 {
-                    vlt.OpenStorage(true);
+                    OpenVaultStorage(vlt, true);
                     var v = vlt.LoadVault();
                     return v;
                 }
@@ -182,7 +206,7 @@ namespace Certify
             {
                 using (var vlt = ACMESharpUtils.GetVault(this.vaultProfile))
                 {
-                    vlt.OpenStorage();
+                    OpenVaultStorage(vlt, true);
                     var v = vlt.LoadVault();
 
                     List<Guid> toBeRemoved = new List<Guid>();
@@ -466,7 +490,7 @@ namespace Certify
                 {
                     try
                     {
-                        vlt.OpenStorage(true);
+                        OpenVaultStorage(vlt, true);
                         vaultConfig.Registrations.Remove(id);
                         vlt.SaveVault(vaultConfig);
                         return true;
@@ -489,7 +513,7 @@ namespace Certify
                 {
                     lock (VAULT_LOCK)
                     {
-                        vlt.OpenStorage(true);
+                        OpenVaultStorage(vlt, true);
                         if (vaultConfig.Identifiers != null)
                         {
                             var idsToRemove = vaultConfig.Identifiers.Values.Where(i => i.Dns == dns);
@@ -608,7 +632,8 @@ namespace Certify
             //if an identifier exists for the same dns in vault, remove it to avoid confusion
             this.DeleteIdentifierByDNS(domain);
 
-            // ACME service requires international domain names in ascii mode, regiser the new identifier with Lets Encrypt
+            // ACME service requires international domain names in ascii mode, regiser the new
+            // identifier with Lets Encrypt
             var authState = ACMESharpUtils.NewIdentifier(identifierAlias, idnMapping.GetAscii(domain));
 
             var identifier = this.GetIdentifier(identifierAlias, reloadVaultConfig: true);
@@ -624,17 +649,47 @@ namespace Certify
                 var challengeInfo = identifier.Challenges.FirstOrDefault(c => c.Value.Type == challengeType).Value;
 
                 //identifier challenege specification is now ready for use to prepare and answer for LetsEncrypt to check
-                return new PendingAuthorization() { Challenge = challengeInfo, Identifier = identifier, TempFilePath = "", ExtensionlessConfigCheckedOK = false };
+                return new PendingAuthorization() { Challenge = GetAuthorizeChallengeItemFromAuthChallenge(challengeInfo), Identifier = GetDomainIdentifierItemFromIdentifierInfo(identifier), TempFilePath = "", ExtensionlessConfigCheckedOK = false };
             }
             else
             {
                 //identifier is null or already valid (previously authorized)
-                return new PendingAuthorization() { Challenge = null, Identifier = identifier, TempFilePath = "", ExtensionlessConfigCheckedOK = false };
+                return new PendingAuthorization() { Challenge = null, Identifier = GetDomainIdentifierItemFromIdentifierInfo(identifier), TempFilePath = "", ExtensionlessConfigCheckedOK = false };
             }
         }
 
-        public PendingAuthorization PerformIISAutomatedChallengeResponse(CertRequestConfig requestConfig, PendingAuthorization pendingAuth)
+        public AuthorizeChallengeItem GetAuthorizeChallengeItemFromAuthChallenge(AuthorizeChallenge challenge)
         {
+            return new AuthorizeChallengeItem
+            {
+                Status = challenge.Status,
+                ChallengeData = challenge.Challenge
+            };
+        }
+
+        public IdentifierItem GetDomainIdentifierItemFromIdentifierInfo(ACMESharp.Vault.Model.IdentifierInfo identifier)
+        {
+            var i = new IdentifierItem
+            {
+                Id = identifier.Id.ToString(),
+                Alias = identifier.Alias,
+                Name = identifier.Dns,
+                Dns = identifier.Dns,
+                Status = identifier.Authorization?.Status,
+            };
+
+            if (identifier.Authorization != null)
+            {
+                i.AuthorizationExpiry = identifier.Authorization.Expires;
+                i.IsAuthorizationPending = identifier.Authorization.IsPending();
+            }
+
+            return i;
+        }
+
+        public PendingAuthorization PerformIISAutomatedChallengeResponse(IISManager iisManager, ManagedSite managedSite, PendingAuthorization pendingAuth)
+        {
+            var requestConfig = managedSite.RequestConfig;
             bool extensionlessConfigOK = false;
 
             //if validation proxy enabled, access to the domain being validated is checked via our remote API rather than directly on the servers
@@ -643,12 +698,17 @@ namespace Certify
             //if copying the file for the user, attempt that now
             if (pendingAuth.Challenge != null && requestConfig.PerformChallengeFileCopy)
             {
-                var httpChallenge = (ACMESharp.ACME.HttpChallenge)pendingAuth.Challenge.Challenge;
+                var httpChallenge = (ACMESharp.ACME.HttpChallenge)pendingAuth.Challenge.ChallengeData;
                 this.LogAction("Preparing challenge response for LetsEncrypt server to check at: " + httpChallenge.FileUrl);
                 this.LogAction("If the challenge response file is not accessible at this exact URL the validation will fail and a certificate will not be issued.");
 
+                // get website root path
+                string websiteRootPath = requestConfig.WebsiteRootPath;
+                Environment.SetEnvironmentVariable("websiteroot", iisManager.GetSitePhysicalPath(managedSite)); // sets env variable for this process only
+                websiteRootPath = Environment.ExpandEnvironmentVariables(websiteRootPath); // expand all env variables
+
                 //copy temp file to path challenge expects in web folder
-                var destFile = Path.Combine(requestConfig.WebsiteRootPath, httpChallenge.FilePath);
+                var destFile = Path.Combine(websiteRootPath, httpChallenge.FilePath);
                 var destPath = Path.GetDirectoryName(destFile);
                 if (!Directory.Exists(destPath))
                 {
@@ -659,8 +719,13 @@ namespace Certify
                 System.IO.File.WriteAllText(destFile, httpChallenge.FileContent);
 
                 var wellknownContentPath = httpChallenge.FilePath.Substring(0, httpChallenge.FilePath.LastIndexOf("/"));
-                var testFilePath = Path.Combine(requestConfig.WebsiteRootPath, wellknownContentPath + "//configcheck");
-                System.IO.File.WriteAllText(testFilePath, "Extensionless File Config Test - OK");
+                var testFilePath = Path.Combine(websiteRootPath, wellknownContentPath + "//configcheck");
+
+                // write the config check file if it doesn't already exist
+                if (!File.Exists(testFilePath))
+                {
+                    System.IO.File.WriteAllText(testFilePath, "Extensionless File Config Test - OK");
+                }
 
                 //create a web.config for extensionless files, then test it (make a request for the extensionless configcheck file over http)
                 string webConfigContent = Core.Properties.Resources.IISWebConfig;
@@ -700,17 +765,20 @@ namespace Certify
                     }
                 }
 
-                if (!extensionlessConfigOK && requestConfig.PerformAutoConfig)
+                if (requestConfig.PerformExtensionlessConfigChecks)
                 {
-                    //if first attempt(s) at config failed, try an alternative config
-                    webConfigContent = Properties.Resources.IISWebConfigAlt;
-
-                    System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
-
-                    if (CheckURL("http://" + requestConfig.PrimaryDomain + "/" + wellknownContentPath + "/configcheck", checkViaProxy))
+                    if (!extensionlessConfigOK && requestConfig.PerformAutoConfig)
                     {
-                        //ready to complete challenge
-                        extensionlessConfigOK = true;
+                        //if first attempt(s) at config failed, try an alternative config
+                        webConfigContent = Properties.Resources.IISWebConfigAlt;
+
+                        System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
+
+                        if (CheckURL("http://" + requestConfig.PrimaryDomain + "/" + wellknownContentPath + "/configcheck", checkViaProxy))
+                        {
+                            //ready to complete challenge
+                            extensionlessConfigOK = true;
+                        }
                     }
                 }
             }
