@@ -3,7 +3,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 
 namespace Certify.Management
@@ -34,20 +33,10 @@ namespace Certify.Management
             _iisManager = new IISManager();
         }
 
-        public bool IsIISAvailable
-        {
-            get
-            {
-                if (_iisManager != null && _iisManager.IsIISAvailable)
-                {
-                    return true;
-                }
-                else
-                {
-                    return false;
-                }
-            }
-        }
+        // expose IIS metadata
+        public bool IsIISAvailable => _iisManager?.IsIISAvailable ?? false;
+
+        public Version IISVersion => _iisManager.GetIisVersion();
 
         /// <summary>
         /// Check if we have one or more managed sites setup 
@@ -101,6 +90,21 @@ namespace Certify.Management
         public bool HasRegisteredContacts()
         {
             return _vaultProvider.HasRegisteredContacts();
+        }
+
+        public async Task<APIResult> TestChallenge(ManagedSite managedSite)
+        {
+            return await _vaultProvider.TestChallengeResponse(_iisManager, managedSite);
+        }
+
+        public async Task<APIResult> RevokeCertificate(ManagedSite managedSite)
+        {
+            var result = await _vaultProvider.RevokeCertificate(managedSite);
+            if (result.IsOK)
+            {
+                managedSite.CertificateRevoked = true;
+            }
+            return result;
         }
 
         /// <summary>
@@ -193,6 +197,17 @@ namespace Certify.Management
             }
         }
 
+        private void LogMessage(string managedSiteId, List<string> msgs, LogItemType logType = LogItemType.GeneralInfo)
+        {
+            foreach (var msg in msgs)
+            {
+                if (msg != null)
+                {
+                    LogMessage(managedSiteId, msg, logType);
+                }
+            }
+        }
+
         private void LogMessage(string managedSiteId, string msg, LogItemType logType = LogItemType.GeneralInfo)
         {
             ManagedSiteLog.AppendLog(managedSiteId, new ManagedSiteLogItem
@@ -205,7 +220,17 @@ namespace Certify.Management
 
         public async Task<CertificateRequestResult> PerformCertificateRequest(ManagedSite managedSite, IProgress<RequestProgressState> progress = null)
         {
-            // FIXME: refactor into different concerns, there's way to much being done here
+            // FIXME: refactor into different concerns, there's way too much being done here
+            if (managedSite.RequestConfig.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP && managedSite.RequestConfig.PerformExtensionlessConfigChecks)
+            {
+                ReportProgress(progress, new RequestProgressState { IsRunning = true, CurrentState = RequestState.Running, Message = "Performing Config Tests" });
+
+                var testResult = await TestChallenge(managedSite);
+                if (!testResult.IsOK)
+                {
+                    return new CertificateRequestResult { ManagedItem = managedSite, IsSuccess = false, Message = String.Join("; ", testResult.FailedItemSummary), Result = testResult.Result };
+                }
+            }
 
             return await Task.Run(async () =>
             {
@@ -257,10 +282,12 @@ namespace Certify.Management
                     // begin by assuming all identifiers are valid
                     bool allIdentifiersValidated = true;
 
-                    if (config.ChallengeType == null) config.ChallengeType = "http-01";
+                    if (config.ChallengeType == null) config.ChallengeType = ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP;
 
                     List<PendingAuthorization> identifierAuthorizations = new List<PendingAuthorization>();
                     var distinctDomains = allDomains.Distinct();
+
+                    string failureSummaryMessage = null;
 
                     // perform validation process for each domain
                     foreach (var domain in distinctDomains)
@@ -279,7 +306,7 @@ namespace Certify.Management
 
                         // begin authorization by registering the domain identifier. This may return
                         // an already validated authorization or we may still have to complete the
-                        // authorization challenge
+                        // authorization challenge. When rate limits are encountered, this step may fail.
                         var authorization = _vaultProvider.BeginRegistrationAndValidation(config, domainIdentifierId, challengeType: config.ChallengeType, domain: domain);
 
                         if (authorization != null && authorization.Identifier != null)
@@ -292,18 +319,36 @@ namespace Certify.Management
                                 {
                                     ReportProgress(progress, $"Performing Challenge Response via IIS: {domain} ");
 
-                                    //ask LE to check our answer to their authorization challenge (http), LE will then attempt to fetch our answer, if all accessible and correct (authorized) LE will then allow us to request a certificate
-                                    //prepare IIS with answer for the LE challenege
+                                    // ask LE to check our answer to their authorization challenge
+                                    // (http-01 or tls-sni-01), LE will then attempt to fetch our
+                                    // answer, if all accessible and correct (authorized) LE will
+                                    // then allow us to request a certificate
                                     authorization = _vaultProvider.PerformIISAutomatedChallengeResponse(_iisManager, managedSite, authorization);
 
-                                    //if we attempted extensionless config checks, report any errors
-                                    if (config.PerformAutoConfig && !authorization.ExtensionlessConfigCheckedOK)
+                                    // pass authorization log items onto main log
+                                    /*authorization.LogItems?.ForEach((msg) =>
                                     {
+                                        if (msg != null) LogMessage(managedSite.Id, msg, LogItemType.GeneralInfo);
+                                    });*/
+
+                                    if ((config.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP && config.PerformExtensionlessConfigChecks && !authorization.ExtensionlessConfigCheckedOK) ||
+                                        (config.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_SNI && config.PerformTlsSniBindingConfigChecks && !authorization.TlsSniConfigCheckedOK))
+                                    {
+                                        //if we failed the config checks, report any errors
                                         LogMessage(managedSite.Id, $"Failed prerequisite configuration checks ({ managedSite.ItemType })", LogItemType.CertficateRequestFailed);
 
                                         _siteManager.StoreSettings();
 
-                                        result.Message = "Automated configuration checks failed. Authorizations will not be able to complete.\nCheck you have http bindings for your site and ensure you can browse to http://" + domain + "/.well-known/acme-challenge/configcheck before proceeding.";
+                                        if (config.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP)
+                                        {
+                                            result.Message = "Automated configuration checks failed. Authorizations will not be able to complete.\nCheck you have http bindings for your site and ensure you can browse to http://" + domain + "/.well-known/acme-challenge/configcheck before proceeding.";
+                                        }
+
+                                        if (config.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_SNI)
+                                        {
+                                            result.Message = "Automated configuration checks failed. Authorizations will not be able to complete.\nCheck you have https SNI bindings for your site\n(ex: '0123456789ABCDEF0123456789ABCDEF.0123456789ABCDEF0123456789ABCDEF.acme.invalid') before proceeding.";
+                                        }
+
                                         ReportProgress(progress, new RequestProgressState { CurrentState = RequestState.Error, Message = result.Message, Result = result });
 
                                         break;
@@ -311,23 +356,37 @@ namespace Certify.Management
                                     else
                                     {
                                         ReportProgress(progress, new RequestProgressState { CurrentState = RequestState.Running, Message = $"Requesting Validation from Let's Encrypt: {domain}" });
-
-                                        //ask LE to validate our challenge response
-                                        _vaultProvider.SubmitChallenge(domainIdentifierId, config.ChallengeType);
-
-                                        bool identifierValidated = _vaultProvider.CompleteIdentifierValidationProcess(authorization.Identifier.Alias);
-
-                                        if (!identifierValidated)
+                                        try
                                         {
-                                            ReportProgress(progress, new RequestProgressState { CurrentState = RequestState.Error, Message = "Domain validation failed: " + domain }, managedSite.Id);
+                                            //ask LE to validate our challenge response
+                                            _vaultProvider.SubmitChallenge(domainIdentifierId, config.ChallengeType);
 
-                                            allIdentifiersValidated = false;
+                                            bool identifierValidated = _vaultProvider.CompleteIdentifierValidationProcess(authorization.Identifier.Alias);
+
+                                            if (!identifierValidated)
+                                            {
+                                                var identifierInfo = _vaultProvider.GetDomainIdentifier(domain);
+                                                var errorMsg = identifierInfo?.ValidationError;
+                                                var errorType = identifierInfo?.ValidationErrorType;
+
+                                                failureSummaryMessage = $"Domain validation failed: {domain} \r\n{errorMsg}";
+                                                ReportProgress(progress, new RequestProgressState { CurrentState = RequestState.Error, Message = failureSummaryMessage }, managedSite.Id);
+
+                                                allIdentifiersValidated = false;
+                                            }
+                                            else
+                                            {
+                                                ReportProgress(progress, new RequestProgressState { CurrentState = RequestState.Running, Message = "Domain validation completed: " + domain }, managedSite.Id);
+
+                                                identifierAuthorizations.Add(authorization);
+                                            }
                                         }
-                                        else
+                                        finally
                                         {
-                                            ReportProgress(progress, new RequestProgressState { CurrentState = RequestState.Running, Message = "Domain validation completed: " + domain }, managedSite.Id);
-
-                                            identifierAuthorizations.Add(authorization);
+                                            // clean up challenge answers
+                                            // (.well-known/acme-challenge/* files for http-01 or iis
+                                            // bindings for tls-sni-01)
+                                            authorization.Cleanup();
                                         }
                                     }
                                 }
@@ -353,6 +412,11 @@ namespace Certify.Management
                         {
                             // could not begin authorization
                             LogMessage(managedSite.Id, $"Could not begin authorization for domain with Let's Encrypt: { domain } ");
+
+                            if (authorization != null && authorization.LogItems != null)
+                            {
+                                LogMessage(managedSite.Id, authorization.LogItems);
+                            }
                             allIdentifiersValidated = false;
                         }
 
@@ -386,12 +450,13 @@ namespace Certify.Management
                             // update managed site summary
                             try
                             {
-                                var certInfo = new CertificateManager().GetCertificate(pfxPath);
+                                var certInfo = CertificateManager.LoadCertificate(pfxPath);
                                 managedSite.DateStart = certInfo.NotBefore;
                                 managedSite.DateExpiry = certInfo.NotAfter;
                                 managedSite.DateRenewed = DateTime.Now;
 
                                 managedSite.CertificatePath = pfxPath;
+                                managedSite.CertificateRevoked = false;
 
                                 //ensure certificate contains all the requested domains
                                 var subjectNames = certInfo.GetNameInfo(System.Security.Cryptography.X509Certificates.X509NameType.UpnName, false);
@@ -444,7 +509,7 @@ namespace Certify.Management
                     }
                     else
                     {
-                        result.Message = "Validation of the required challenges did not complete successfully. Please ensure all domains to be referenced in the Certificate can be used to access this site without redirection. ";
+                        result.Message = "Validation of the required challenges did not complete successfully. " + (failureSummaryMessage != null ? failureSummaryMessage : "");
                         LogMessage(managedSite.Id, result.Message, LogItemType.CertficateRequestFailed);
                     }
 
@@ -456,22 +521,41 @@ namespace Certify.Management
                     result.IsSuccess = false;
                     result.Message = managedSite.Name + ": Request failed - " + exp.Message + " " + exp.ToString();
                     LogMessage(managedSite.Id, result.Message, LogItemType.CertficateRequestFailed);
-
+                    LogMessage(managedSite.Id, String.Join("\r\n", _vaultProvider.GetActionSummary()));
                     System.Diagnostics.Debug.WriteLine(exp.ToString());
                 }
                 finally
                 {
-                    // if the request was not aborted, run post-request script, if set
-                    if (!result.Abort && !string.IsNullOrEmpty(config.PostRequestPowerShellScript))
+                    // if the request was not aborted, perform post-request actions
+                    if (!result.Abort)
                     {
-                        try
+                        // run post-request script, if set
+                        if (!string.IsNullOrEmpty(config.PostRequestPowerShellScript))
                         {
-                            string scriptOutput = await PowerShellManager.RunScript(result, config.PostRequestPowerShellScript);
-                            LogMessage(managedSite.Id, $"Post-Request Script output:\n{scriptOutput}");
+                            try
+                            {
+                                string scriptOutput = await PowerShellManager.RunScript(result, config.PostRequestPowerShellScript);
+                                LogMessage(managedSite.Id, $"Post-Request Script output:\n{scriptOutput}");
+                            }
+                            catch (Exception ex)
+                            {
+                                LogMessage(managedSite.Id, $"Post-Request Script error: {ex.Message}");
+                            }
                         }
-                        catch (Exception ex)
+                        // run webhook triggers, if set
+                        if ((config.WebhookTrigger == Webhook.ON_SUCCESS && result.IsSuccess) ||
+                            (config.WebhookTrigger == Webhook.ON_ERROR && !result.IsSuccess) || 
+                            (config.WebhookTrigger == Webhook.ON_SUCCESS_OR_ERROR))
                         {
-                            LogMessage(managedSite.Id, $"Post-Request Script error:\n{ex.Message}");
+                            try
+                            {
+                                var (success, code) = await Webhook.SendRequest(config, result.IsSuccess);
+                                LogMessage(managedSite.Id, $"Webhook invoked: Url: {config.WebhookUrl}, Success: {success}, StatusCode: {code}");
+                            }
+                            catch (Exception ex)
+                            {
+                                LogMessage(managedSite.Id, $"Webhook error: {ex.Message}");
+                            }
                         }
                     }
                 }
@@ -578,7 +662,7 @@ namespace Certify.Management
                     {
                         BindingIPAddress = iisSite?.IP,
                         BindingPort = iisSite?.Port.ToString(),
-                        ChallengeType = "http-01",
+                        ChallengeType = ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP,
                         EnableFailureNotifications = true,
                         PerformAutoConfig = true,
                         PerformAutomatedCertBinding = true,
@@ -628,11 +712,25 @@ namespace Certify.Management
             return sites;
         }
 
+        public static bool IsRenewalRequired(ManagedSite s, int renewalIntervalDays)
+        {
+            // if we know the last renewal date, check whether we should renew again, otherwise
+            // assume it's more than 30 days ago by default and attempt renewal
+
+            var timeSinceLastRenewal = (s.DateRenewed != null ? s.DateRenewed : DateTime.Now.AddDays(-30)) - DateTime.Now;
+
+            bool isRenewalRequired = Math.Abs(timeSinceLastRenewal.Value.TotalDays) > renewalIntervalDays;
+
+            return isRenewalRequired;
+        }
+
         public async Task<List<CertificateRequestResult>> PerformRenewalAllManagedSites(bool autoRenewalOnly = true, Dictionary<string, Progress<RequestProgressState>> progressTrackers = null)
         {
             await Task.Delay(200); //allow UI to update
-                                   //currently the vault won't let us run parallel requests due to file locks
+
+            //currently the vault won't let us run parallel requests due to file locks
             bool performRequestsInParallel = false;
+
             bool testModeOnly = false;
 
             _siteManager.LoadSettings();
@@ -644,27 +742,22 @@ namespace Certify.Management
                 sites = sites.Where(s => s.IncludeInAutoRenew == true);
             }
 
-            //check site list and examine current certificates. If certificate is less than n days old, don't attempt to renew it
+            // check site list and examine current certificates. If certificate is less than n days
+            // old, don't attempt to renew it
             var sitesToRenew = new List<ManagedSite>();
             var renewalIntervalDays = Properties.Settings.Default.RenewalIntervalDays;
 
-#if DEBUG
-            //in debug mode we renew every time instead of skipping based on days old
-            renewalIntervalDays = 0;
-#endif
             int numRenewalTasks = 0;
             int maxRenewalTasks = Properties.Settings.Default.MaxRenewalRequests;
 
             var renewalTasks = new List<Task<CertificateRequestResult>>();
             foreach (var s in sites.Where(s => s.IncludeInAutoRenew == true))
             {
-                //if we know the last renewal date, check whether we should renew again, otherwise assume it's more than 30 days ago by default and attempt renewal
-                var timeSinceLastRenewal = (s.DateRenewed != null ? s.DateRenewed : DateTime.Now.AddDays(-30)) - DateTime.Now;
-
-                bool isRenewalRequired = Math.Abs(timeSinceLastRenewal.Value.TotalDays) > renewalIntervalDays;
-                bool isSiteRunning = true;
+                // determine if this site requires renewal
+                bool isRenewalRequired = IsRenewalRequired(s, renewalIntervalDays);
 
                 //if we care about stopped sites being stopped, check for that
+                bool isSiteRunning = true;
                 if (Properties.Settings.Default.IgnoreStoppedSites)
                 {
                     isSiteRunning = IsManagedSiteRunning(s.Id);

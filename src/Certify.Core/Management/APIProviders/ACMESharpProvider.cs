@@ -89,6 +89,11 @@ namespace Certify.Management.APIProviders
             return _vaultManager.GetVaultPath();
         }
 
+        public List<string> GetActionSummary()
+        {
+            return _vaultManager.GetActionLogSummary();
+        }
+
         public void EnableSensitiveFileEncryption()
         {
             _vaultManager.UseEFSForSensitiveFiles = true;
@@ -101,7 +106,21 @@ namespace Certify.Management.APIProviders
 
         public PendingAuthorization PerformIISAutomatedChallengeResponse(IISManager iisManager, ManagedSite managedSite, PendingAuthorization pendingAuth)
         {
-            return _vaultManager.PerformIISAutomatedChallengeResponse(iisManager, managedSite, pendingAuth);
+            var processedAuth = _vaultManager.PerformIISAutomatedChallengeResponse(iisManager, managedSite, pendingAuth);
+            if (_vaultManager.ActionLogs != null)
+            {
+                processedAuth.LogItems = new List<string>();
+                foreach (var a in _vaultManager.ActionLogs)
+                {
+                    processedAuth.LogItems.Add(a.Command + (a.Result != null ? a.Result : ""));
+                }
+            }
+            return processedAuth;
+        }
+
+        public async Task<APIResult> TestChallengeResponse(IISManager iisManager, ManagedSite managedSite)
+        {
+            return await _vaultManager.TestChallengeResponse(iisManager, managedSite);
         }
 
         public void SubmitChallenge(string domainIdentifierId, string challengeType)
@@ -117,6 +136,11 @@ namespace Certify.Management.APIProviders
         public ProcessStepResult PerformCertificateRequestProcess(string primaryDnsIdentifier, string[] alternativeDnsIdentifiers)
         {
             return _vaultManager.PerformCertificateRequestProcess(primaryDnsIdentifier, alternativeDnsIdentifiers);
+        }
+
+        public async Task<APIResult> RevokeCertificate(ManagedSite managedSite)
+        {
+            return await _vaultManager.RevokeCertificate(managedSite.CertificatePath);
         }
 
         #region IACMEClientProvider methods

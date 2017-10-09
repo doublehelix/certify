@@ -53,7 +53,18 @@ namespace Certify.Management.APIProviders
             return null;
         }
 
+        public List<string> GetActionSummary()
+        {
+            System.Diagnostics.Debug.WriteLine("Certes: GetActionSummary not implemented");
+            return null;
+        }
+
         public void EnableSensitiveFileEncryption()
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<APIResult> RevokeCertificate(ManagedSite managedSite)
         {
             throw new NotImplementedException();
         }
@@ -97,6 +108,11 @@ namespace Certify.Management.APIProviders
         }
 
         public PendingAuthorization PerformIISAutomatedChallengeResponse(IISManager iisManager, ManagedSite managedSite, PendingAuthorization pendingAuth)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<APIResult> TestChallengeResponse(IISManager iISManager, ManagedSite managedSite)
         {
             throw new NotImplementedException();
         }

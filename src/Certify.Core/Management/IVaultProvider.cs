@@ -22,6 +22,8 @@ namespace Certify.Management
 
         string GetVaultSummary();
 
+        List<string> GetActionSummary();
+
         void EnableSensitiveFileEncryption();
 
         string ComputeDomainIdentifierId(string domain);
@@ -32,10 +34,14 @@ namespace Certify.Management
 
         PendingAuthorization PerformIISAutomatedChallengeResponse(IISManager iisManager, ManagedSite managedSite, PendingAuthorization pendingAuth);
 
+        Task<APIResult> TestChallengeResponse(IISManager iisManager, ManagedSite managedSite);
+
         void SubmitChallenge(string domainIdentifierId, string challengeType);
 
         bool CompleteIdentifierValidationProcess(string alias);
 
         ProcessStepResult PerformCertificateRequestProcess(string primaryDnsIdentifier, string[] alternativeDnsIdentifiers);
+
+        Task<APIResult> RevokeCertificate(ManagedSite managedSite);
     }
 }

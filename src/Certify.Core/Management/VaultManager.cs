@@ -11,9 +11,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Certify
 {
@@ -31,6 +31,7 @@ namespace Certify
         private string vaultFilename;
         private string vaultProfile = null;
         public List<ActionLogItem> ActionLogs { get; }
+        private NetworkUtils NetUtil;
 
         internal const string VAULT_LOCK = "CertifyVault";
 
@@ -52,6 +53,8 @@ namespace Certify
             this.vaultFilename = vaultFilename;
 
             this.ActionLogs = new List<ActionLogItem>();
+            this.ActionLogs.Capacity = 1000;
+            this.NetUtil = new NetworkUtils { Log = (message) => LogAction(message) };
 
 #if DEBUG
             this.InitVault(staging: true);
@@ -454,6 +457,32 @@ namespace Certify
             }
         }
 
+        public async Task<APIResult> RevokeCertificate(string pfxPath)
+        {
+            var fi = new FileInfo(pfxPath);
+            string certAlias = fi.Name.Replace("-all.pfx", "");
+            return await Task<APIResult>.Run(() =>
+            {
+                try
+                {
+                    return new APIResult()
+                    {
+                        IsOK = true,
+                        Result = ACMESharpUtils.RevokeCertificate(certAlias)
+                    };
+                }
+                catch (Exception ex)
+                {
+                    return new APIResult()
+                    {
+                        IsOK = false,
+                        FailedItemSummary = new List<string>() { $"Certificate revocation error: {ex.Message}" },
+                        Message = ex.Message
+                    };
+                }
+            });
+        }
+
         public bool CertExists(string domainAlias)
         {
             var certRef = "cert_" + domainAlias;
@@ -607,22 +636,22 @@ namespace Certify
             }
         }
 
-        public void UpdateIdentifier(string domainIdentifierAlias)
+        public AuthorizationState UpdateIdentifier(string domainIdentifierAlias)
         {
-            ACMESharpUtils.UpdateIdentifier(domainIdentifierAlias);
+            return ACMESharpUtils.UpdateIdentifier(domainIdentifierAlias);
         }
 
-        public void SubmitChallenge(string alias, string challengeType = "http-01")
+        public AuthorizationState SubmitChallenge(string alias, string challengeType = ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP)
         {
             //well known challenge all ready to be read by server
-            ACMESharpUtils.SubmitChallenge(alias, challengeType);
+            return ACMESharpUtils.SubmitChallenge(alias, challengeType);
         }
 
         #endregion Vault Operations
 
         #region ACME Workflow Steps
 
-        public PendingAuthorization BeginRegistrationAndValidation(CertRequestConfig requestConfig, string identifierAlias, string challengeType = "http-01", string domain = null)
+        public PendingAuthorization BeginRegistrationAndValidation(CertRequestConfig requestConfig, string identifierAlias, string challengeType = ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP, string domain = null)
         {
             //if no alternative domain specified, use the primary domains as the subject
             if (domain == null) domain = requestConfig.PrimaryDomain;
@@ -632,7 +661,7 @@ namespace Certify
             //if an identifier exists for the same dns in vault, remove it to avoid confusion
             this.DeleteIdentifierByDNS(domain);
 
-            // ACME service requires international domain names in ascii mode, regiser the new
+            // ACME service requires international domain names in ascii mode, register the new
             // identifier with Lets Encrypt
             var authState = ACMESharpUtils.NewIdentifier(identifierAlias, idnMapping.GetAscii(domain));
 
@@ -646,15 +675,24 @@ namespace Certify
                 //get challenge info
                 ReloadVaultConfig();
                 identifier = GetIdentifier(identifierAlias);
-                var challengeInfo = identifier.Challenges.FirstOrDefault(c => c.Value.Type == challengeType).Value;
+                try
+                {
+                    //identifier challenge specification is now ready for use to prepare and answer for LetsEncrypt to check
 
-                //identifier challenege specification is now ready for use to prepare and answer for LetsEncrypt to check
-                return new PendingAuthorization() { Challenge = GetAuthorizeChallengeItemFromAuthChallenge(challengeInfo), Identifier = GetDomainIdentifierItemFromIdentifierInfo(identifier), TempFilePath = "", ExtensionlessConfigCheckedOK = false };
+                    var challengeInfo = identifier.Challenges.FirstOrDefault(c => c.Value.Type == challengeType).Value;
+                    return new PendingAuthorization() { Challenge = GetAuthorizeChallengeItemFromAuthChallenge(challengeInfo), Identifier = GetDomainIdentifierItemFromIdentifierInfo(identifier), TempFilePath = "", ExtensionlessConfigCheckedOK = false, LogItems = this.GetActionLogSummary() };
+                }
+                catch (Exception exp)
+                {
+                    LogAction("GetIdentifier", exp.ToString());
+                    //identifier challenge could not be requested this time (FIXME: did we discard it when reloading vault?)
+                    return null;
+                }
             }
             else
             {
                 //identifier is null or already valid (previously authorized)
-                return new PendingAuthorization() { Challenge = null, Identifier = GetDomainIdentifierItemFromIdentifierInfo(identifier), TempFilePath = "", ExtensionlessConfigCheckedOK = false };
+                return new PendingAuthorization() { Challenge = null, Identifier = GetDomainIdentifierItemFromIdentifierInfo(identifier), TempFilePath = "", ExtensionlessConfigCheckedOK = false, LogItems = this.GetActionLogSummary() };
             }
         }
 
@@ -669,123 +707,361 @@ namespace Certify
 
         public IdentifierItem GetDomainIdentifierItemFromIdentifierInfo(ACMESharp.Vault.Model.IdentifierInfo identifier)
         {
+            if (identifier == null) return null;
+
             var i = new IdentifierItem
             {
                 Id = identifier.Id.ToString(),
                 Alias = identifier.Alias,
                 Name = identifier.Dns,
                 Dns = identifier.Dns,
-                Status = identifier.Authorization?.Status,
+                Status = identifier.Authorization?.Status
             };
 
             if (identifier.Authorization != null)
             {
                 i.AuthorizationExpiry = identifier.Authorization.Expires;
                 i.IsAuthorizationPending = identifier.Authorization.IsPending();
-            }
 
+                if (identifier.Authorization.Status == "invalid")
+                {
+                    var failedChallenge = identifier.Authorization.Challenges?.FirstOrDefault(c => c.ChallengePart?.Error != null);
+                    if (failedChallenge != null)
+                    {
+                        i.ValidationError = String.Join("\r\n", failedChallenge.ChallengePart.Error);
+                        i.ValidationErrorType = failedChallenge.ChallengePart.Error["type"];
+                    }
+                }
+            }
             return i;
+        }
+
+        /// <summary>
+        /// Simulates responding to a challenge, performs a sample configuration and attempts to
+        /// verify it.
+        /// </summary>
+        /// <param name="iisManager"></param>
+        /// <param name="managedSite"></param>
+        /// <returns> APIResult </returns>
+        /// <remarks>
+        /// The purpose of this method is to test the options (permissions, configuration) before
+        /// submitting a request to the ACME server, to avoid creating failed requests and hitting
+        /// usage limits.
+        /// </remarks>
+        public async Task<APIResult> TestChallengeResponse(IISManager iisManager, ManagedSite managedSite)
+        {
+            return await Task.Run(() =>
+            {
+                ActionLogs.Clear(); // reset action logs
+
+                var requestConfig = managedSite.RequestConfig;
+                var result = new APIResult();
+                var domains = new List<string> { requestConfig.PrimaryDomain };
+
+                if (requestConfig.SubjectAlternativeNames != null)
+                {
+                    domains.AddRange(requestConfig.SubjectAlternativeNames);
+                }
+
+                var generatedAuthorizations = new List<PendingAuthorization>();
+
+                try
+                {
+                    // check all domain configs
+                    Parallel.ForEach(domains.Distinct(), new ParallelOptions
+                    {
+                        // check 8 domains at a time
+                        MaxDegreeOfParallelism = 8
+                    },
+                    domain =>
+                    {
+                        var (ok, message) = NetUtil.CheckDNS(domain);
+                        if (!ok)
+                        {
+                            result.IsOK = false;
+                            result.FailedItemSummary.Add(message);
+                        }
+                    });
+                    if (!result.IsOK)
+                    {
+                        return result;
+                    }
+
+                    if (requestConfig.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP)
+                    {
+                        foreach (var domain in domains.Distinct())
+                        {
+                            string challengeFileUrl = $"http://{domain}/.well-known/acme-challenge/configcheck";
+
+                            var simulatedAuthorization = new PendingAuthorization
+                            {
+                                Challenge = new AuthorizeChallengeItem
+                                {
+                                    ChallengeData = new ACMESharp.ACME.HttpChallenge(ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_HTTP,
+                                    new ACMESharp.ACME.HttpChallengeAnswer { KeyAuthorization = GenerateSimulatedKeyAuth() })
+                                    {
+                                        FilePath = ".well-known/acme-challenge/configcheck",
+                                        FileContent = "Extensionless File Config Test - OK",
+                                        FileUrl = challengeFileUrl
+                                    }
+                                }
+                            };
+
+                            generatedAuthorizations.Add(simulatedAuthorization);
+
+                            var resultOK = PrepareChallengeResponse_Http01(
+                               iisManager, domain, managedSite, simulatedAuthorization
+                            )();
+
+                            if (!resultOK)
+                            {
+                                result.IsOK = false;
+                                result.FailedItemSummary.Add($"Config checks failed to verify http://{domain} is both publicly accessible and can serve extensionless files e.g. {challengeFileUrl}");
+                            }
+                        }
+                    }
+                    else if (requestConfig.ChallengeType == ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_SNI)
+                    {
+                        if (iisManager.GetIisVersion().Major < 8)
+                        {
+                            result.IsOK = false;
+                            result.FailedItemSummary.Add($"The {ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_SNI} challenge is only available for IIS versions 8+.");
+                            return result;
+                        }
+
+                        result.IsOK = domains.Distinct().All(domain =>
+                        {
+                            var simulatedAuthorization = new PendingAuthorization
+                            {
+                                Challenge = new AuthorizeChallengeItem()
+                                {
+                                    ChallengeData = new ACMESharp.ACME.TlsSniChallenge(ACMESharpCompat.ACMESharpUtils.CHALLENGE_TYPE_SNI,
+                                    new ACMESharp.ACME.TlsSniChallengeAnswer { KeyAuthorization = GenerateSimulatedKeyAuth() })
+                                    {
+                                        IterationCount = 1
+                                    }
+                                }
+                            };
+                            generatedAuthorizations.Add(simulatedAuthorization);
+                            return PrepareChallengeResponse_TlsSni01(
+                                iisManager, domain, managedSite, simulatedAuthorization
+                            )();
+                        });
+                    }
+                    else
+                    {
+                        throw new NotSupportedException($"ChallengeType not supported: {requestConfig.ChallengeType}");
+                    }
+                }
+                finally
+                {
+                    result.Message = String.Join("\r\n", GetActionLogSummary());
+                    generatedAuthorizations.ForEach(ga => ga.Cleanup());
+                }
+                return result;
+            });
+        }
+
+        /// <summary>
+        /// Creates a realistic-looking simulated Key Authorization 
+        /// </summary>
+        /// <remarks>
+        /// example KeyAuthorization (from
+        /// https://tools.ietf.org/html/draft-ietf-acme-acme-01#section-7.2):
+        /// "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA.nP1qzpXGymHBrUEepNY9HCsQk7K8KhOypzEt62jcerQ"
+        /// i.e. [token-string].[sha256(token-string bytes)] where token-string is &gt;= 128 bits of data
+        /// </remarks>
+        private string GenerateSimulatedKeyAuth()
+        {
+            // create simulated challenge
+            var random = new Random();
+            var simulated_token_data = new byte[24]; // generate 192 bits of data
+            random.NextBytes(simulated_token_data);
+            string simulated_token = Convert.ToBase64String(simulated_token_data);
+            var sha256 = System.Security.Cryptography.SHA256.Create();
+            byte[] thumbprint_data = sha256.ComputeHash(Encoding.UTF8.GetBytes(simulated_token));
+            var thumbprint = BitConverter.ToString(thumbprint_data).Replace("-", "").ToLower();
+            return $"{simulated_token}.{thumbprint}";
         }
 
         public PendingAuthorization PerformIISAutomatedChallengeResponse(IISManager iisManager, ManagedSite managedSite, PendingAuthorization pendingAuth)
         {
             var requestConfig = managedSite.RequestConfig;
-            bool extensionlessConfigOK = false;
-
-            //if validation proxy enabled, access to the domain being validated is checked via our remote API rather than directly on the servers
-            bool checkViaProxy = Certify.Properties.Settings.Default.EnableValidationProxyAPI;
-
-            //if copying the file for the user, attempt that now
-            if (pendingAuth.Challenge != null && requestConfig.PerformChallengeFileCopy)
+            var domain = pendingAuth.Identifier.Dns;
+            if (pendingAuth.Challenge != null)
             {
-                var httpChallenge = (ACMESharp.ACME.HttpChallenge)pendingAuth.Challenge.ChallengeData;
-                this.LogAction("Preparing challenge response for LetsEncrypt server to check at: " + httpChallenge.FileUrl);
-                this.LogAction("If the challenge response file is not accessible at this exact URL the validation will fail and a certificate will not be issued.");
-
-                // get website root path
-                string websiteRootPath = requestConfig.WebsiteRootPath;
-                Environment.SetEnvironmentVariable("websiteroot", iisManager.GetSitePhysicalPath(managedSite)); // sets env variable for this process only
-                websiteRootPath = Environment.ExpandEnvironmentVariables(websiteRootPath); // expand all env variables
-
-                //copy temp file to path challenge expects in web folder
-                var destFile = Path.Combine(websiteRootPath, httpChallenge.FilePath);
-                var destPath = Path.GetDirectoryName(destFile);
-                if (!Directory.Exists(destPath))
+                if (pendingAuth.Challenge.ChallengeData is ACMESharp.ACME.HttpChallenge
+                    && requestConfig.PerformChallengeFileCopy /* is this needed? */)
                 {
-                    Directory.CreateDirectory(destPath);
-                }
-
-                //copy challenge response to web folder /.well-known/acme-challenge
-                System.IO.File.WriteAllText(destFile, httpChallenge.FileContent);
-
-                var wellknownContentPath = httpChallenge.FilePath.Substring(0, httpChallenge.FilePath.LastIndexOf("/"));
-                var testFilePath = Path.Combine(websiteRootPath, wellknownContentPath + "//configcheck");
-
-                // write the config check file if it doesn't already exist
-                if (!File.Exists(testFilePath))
-                {
-                    System.IO.File.WriteAllText(testFilePath, "Extensionless File Config Test - OK");
-                }
-
-                //create a web.config for extensionless files, then test it (make a request for the extensionless configcheck file over http)
-                string webConfigContent = Core.Properties.Resources.IISWebConfig;
-
-                if (!File.Exists(destPath + "\\web.config"))
-                {
-                    //no existing config, attempt auto config and perform test
-                    System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
+                    var check = PrepareChallengeResponse_Http01(iisManager, domain, managedSite, pendingAuth);
                     if (requestConfig.PerformExtensionlessConfigChecks)
                     {
-                        if (CheckURL("http://" + requestConfig.PrimaryDomain + "/" + wellknownContentPath + "/configcheck", checkViaProxy))
-                        {
-                            extensionlessConfigOK = true;
-                        }
+                        pendingAuth.ExtensionlessConfigCheckedOK = check();
                     }
                 }
-                else
+                if (pendingAuth.Challenge.ChallengeData is ACMESharp.ACME.TlsSniChallenge)
                 {
-                    //web config already exists, don't overwrite it, just test it
-
-                    if (requestConfig.PerformExtensionlessConfigChecks)
+                    var check = PrepareChallengeResponse_TlsSni01(iisManager, domain, managedSite, pendingAuth);
+                    if (requestConfig.PerformTlsSniBindingConfigChecks)
                     {
-                        if (CheckURL("http://" + requestConfig.PrimaryDomain + "/" + wellknownContentPath + "/configcheck", checkViaProxy))
-                        {
-                            extensionlessConfigOK = true;
-                        }
-                        if (!extensionlessConfigOK && requestConfig.PerformAutoConfig)
-                        {
-                            //didn't work, try our default config
-                            System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
-
-                            if (CheckURL("http://" + requestConfig.PrimaryDomain + "/" + wellknownContentPath + "/configcheck", checkViaProxy))
-                            {
-                                extensionlessConfigOK = true;
-                            }
-                        }
-                    }
-                }
-
-                if (requestConfig.PerformExtensionlessConfigChecks)
-                {
-                    if (!extensionlessConfigOK && requestConfig.PerformAutoConfig)
-                    {
-                        //if first attempt(s) at config failed, try an alternative config
-                        webConfigContent = Properties.Resources.IISWebConfigAlt;
-
-                        System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
-
-                        if (CheckURL("http://" + requestConfig.PrimaryDomain + "/" + wellknownContentPath + "/configcheck", checkViaProxy))
-                        {
-                            //ready to complete challenge
-                            extensionlessConfigOK = true;
-                        }
+                        // set config check OK if all checks return true
+                        pendingAuth.TlsSniConfigCheckedOK = check();
                     }
                 }
             }
-
-            //configuration applied, ready to ask LE to validate our answer
-            pendingAuth.ExtensionlessConfigCheckedOK = extensionlessConfigOK;
             return pendingAuth;
+        }
+
+        /// <summary>
+        /// Prepares IIS to respond to a http-01 challenge 
+        /// </summary>
+        /// <returns>
+        /// A Boolean returning Func. Invoke the Func to test the challenge response locally.
+        /// </returns>
+        private Func<bool> PrepareChallengeResponse_Http01(IISManager iisManager, string domain, ManagedSite managedSite, PendingAuthorization pendingAuth)
+        {
+            var requestConfig = managedSite.RequestConfig;
+            var httpChallenge = (ACMESharp.ACME.HttpChallenge)pendingAuth.Challenge.ChallengeData;
+            this.LogAction("Preparing challenge response for LetsEncrypt server to check at: " + httpChallenge.FileUrl);
+            this.LogAction("If the challenge response file is not accessible at this exact URL the validation will fail and a certificate will not be issued.");
+
+            // get website root path, expand environment variables if required
+            string websiteRootPath = requestConfig.WebsiteRootPath;
+
+            // if website root path not specified, determine it now
+            if (String.IsNullOrEmpty(websiteRootPath))
+            {
+                websiteRootPath = iisManager.GetSitePhysicalPath(managedSite);
+            }
+
+            if (!String.IsNullOrEmpty(websiteRootPath) && websiteRootPath.Contains("%"))
+            {
+                // if websiteRootPath contains %websiteroot% variable, replace that with the current
+                // physical path for the site
+                if (websiteRootPath.Contains("%websiteroot%"))
+                {
+                    // sets env variable for this process only
+                    Environment.SetEnvironmentVariable("websiteroot", iisManager.GetSitePhysicalPath(managedSite));
+                }
+                // expand any environment variables present in site path
+                websiteRootPath = Environment.ExpandEnvironmentVariables(websiteRootPath);
+            }
+
+            if (String.IsNullOrEmpty(websiteRootPath) || !Directory.Exists(websiteRootPath))
+            {
+                // our website no longer appears to exist on disk, continuing would potentially
+                // create unwanted folders, so it's time for us to give up
+                this.LogAction($"The website root path for {managedSite.Name} could not be determined. Request cannot continue.");
+                return () => false;
+            }
+
+            // copy temp file to path challenge expects in web folder
+            var destFile = Path.Combine(websiteRootPath, httpChallenge.FilePath);
+            var destPath = Path.GetDirectoryName(destFile);
+
+            if (!Directory.Exists(destPath))
+            {
+                Directory.CreateDirectory(destPath);
+            }
+
+            // copy challenge response to web folder /.well-known/acme-challenge. Check if it already
+            // exists (as in 'configcheck' file) as can cause conflicts.
+            if (!File.Exists(destFile))
+            {
+                File.WriteAllText(destFile, httpChallenge.FileContent);
+            }
+
+            // configure cleanup - should this be configurable? Because in some case many sites
+            // renewing may all point to the same web root, we keep the configcheck file
+            pendingAuth.Cleanup = () =>
+            {
+                if (!destFile.EndsWith("configcheck")) File.Delete(destFile);
+            };
+
+            // create a web.config for extensionless files, then test it (make a request for the
+            // extensionless configcheck file over http)
+            string webConfigContent = Core.Properties.Resources.IISWebConfig;
+
+            if (!File.Exists(destPath + "\\web.config"))
+            {
+                // no existing config, attempt auto config and perform test
+                this.LogAction($"Config does not exist, writing default config to: {destPath}\\web.config");
+                System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
+                return () => NetUtil.CheckURL($"http://{domain}/{httpChallenge.FilePath}");
+            }
+            else
+            {
+                // web config already exists, don't overwrite it, just test it
+                return () =>
+                {
+                    if (NetUtil.CheckURL($"http://{domain}/{httpChallenge.FilePath}"))
+                    {
+                        return true;
+                    }
+
+                    if (requestConfig.PerformAutoConfig)
+                    {
+                        this.LogAction($"Pre-config check failed: Auto-config will overwrite existing config: {destPath}\\web.config");
+                        // didn't work, try our default config
+                        System.IO.File.WriteAllText(destPath + "\\web.config", webConfigContent);
+
+                        if (NetUtil.CheckURL($"http://{domain}/{httpChallenge.FilePath}"))
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+            }
+        }
+
+        /// <summary>
+        /// Prepares IIS to respond to a tls-sni-01 challenge 
+        /// </summary>
+        /// <returns>
+        /// A Boolean-returning Func. Invoke the Func to test the challenge response locally.
+        /// </returns>
+        private Func<bool> PrepareChallengeResponse_TlsSni01(IISManager iisManager, string domain, ManagedSite managedSite, PendingAuthorization pendingAuth)
+        {
+            var requestConfig = managedSite.RequestConfig;
+            var tlsSniChallenge = (ACMESharp.ACME.TlsSniChallenge)pendingAuth.Challenge.ChallengeData;
+            var tlsSniAnswer = (ACMESharp.ACME.TlsSniChallengeAnswer)tlsSniChallenge.Answer;
+            var sha256 = System.Security.Cryptography.SHA256.Create();
+            var z = new byte[tlsSniChallenge.IterationCount][];
+
+            // compute n sha256 hashes, where n=challengedata.iterationcount
+            z[0] = sha256.ComputeHash(Encoding.UTF8.GetBytes(tlsSniAnswer.KeyAuthorization));
+            for (int i = 1; i < z.Length; i++)
+            {
+                z[i] = sha256.ComputeHash(z[i - 1]);
+            }
+            // generate certs and install iis bindings
+            var cleanupQueue = new List<Action>();
+            var checkQueue = new List<Func<bool>>();
+            foreach (string hex in z.Select(b =>
+                BitConverter.ToString(b).Replace("-", "").ToLower()))
+            {
+                string sni = $"{hex.Substring(0, 32)}.{hex.Substring(32)}.acme.invalid";
+                this.LogAction($"Preparing binding at: https://{domain}, sni: {sni}");
+
+                var x509 = CertificateManager.GenerateTlsSni01Certificate(sni);
+                CertificateManager.StoreCertificate(x509);
+                iisManager.InstallCertificateforBinding(managedSite, x509, sni);
+
+                // add check to the queue
+                checkQueue.Add(() => NetUtil.CheckSNI(domain, sni));
+
+                // add cleanup actions to queue
+                cleanupQueue.Add(() => iisManager.RemoveHttpsBinding(managedSite, sni));
+                cleanupQueue.Add(() => CertificateManager.RemoveCertificate(x509));
+            }
+
+            // configure cleanup to execute the cleanup queue
+            pendingAuth.Cleanup = () => cleanupQueue.ForEach(a => a());
+
+            // perform our own config checks
+            pendingAuth.TlsSniConfigCheckedOK = true;
+            return () => checkQueue.All(check => check());
         }
 
         public bool CompleteIdentifierValidationProcess(string domainIdentifierAlias)
@@ -807,6 +1083,11 @@ namespace Certify
             {
                 //still pending or failed
                 System.Diagnostics.Debug.WriteLine("LE Authorization problem: " + identiferStatus.Authorization.Status);
+
+                var failedChallenge = identiferStatus.Authorization.Challenges.FirstOrDefault(c => c.ChallengePart.Error != null);
+                // throw new Exception(String.Join("\r\n", failedChallenge.ChallengePart.Error));
+                LogAction(String.Join("\r\n", failedChallenge.ChallengePart.Error));
+
                 return false;
             }
             else
@@ -818,8 +1099,6 @@ namespace Certify
 
         public ProcessStepResult PerformCertificateRequestProcess(string domainIdentifierRef, string[] alternativeIdentifierRefs)
         {
-            //
-
             //all good, we can request a certificate
             //if authorizing a SAN we would need to repeat the above until all domains are valid, then we can request cert
             var certAlias = "cert_" + domainIdentifierRef;
@@ -903,77 +1182,18 @@ namespace Certify
             return "ident" + Guid.NewGuid().ToString().Substring(0, 8).Replace("-", "");
         }
 
-        public string GetActionLogSummary()
+        public List<string> GetActionLogSummary()
         {
-            string output = "";
+            List<string> output = new List<string>();
             if (this.ActionLogs != null)
             {
-                foreach (var a in this.ActionLogs)
+                ActionLogs.ToList().ForEach((a) =>
                 {
-                    output += a.ToString() + "\r\n";
-                }
+                    output.Add(a.Command + " : " + (a.Result != null ? a.Result : ""));
+                });
             }
+
             return output;
-        }
-
-        private bool CheckURL(string url, bool useProxyAPI)
-        {
-            var checkUrl = url + "";
-            if (useProxyAPI)
-            {
-                url = Properties.Resources.APIBaseURI + "testurlaccess?url=" + url;
-            }
-            //check http request to test path works
-            bool checkSuccess = false;
-            try
-            {
-                WebRequest request = WebRequest.Create(url);
-                var response = (HttpWebResponse)request.GetResponse();
-
-                //if checking via proxy, examine result
-                if (useProxyAPI)
-                {
-                    if ((int)response.StatusCode >= 200)
-                    {
-                        var encoding = ASCIIEncoding.UTF8;
-                        using (var reader = new System.IO.StreamReader(response.GetResponseStream(), encoding))
-                        {
-                            string jsonText = reader.ReadToEnd();
-                            this.LogAction("URL Check Result: " + jsonText);
-                            var result = Newtonsoft.Json.JsonConvert.DeserializeObject<Models.API.URLCheckResult>(jsonText);
-                            if (result.IsAccessible == true)
-                            {
-                                checkSuccess = true;
-                            }
-                            else
-                            {
-                                checkSuccess = false;
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    //not checking via proxy, base result on status code
-                    if ((int)response.StatusCode >= 200 && (int)response.StatusCode < 300)
-                    {
-                        checkSuccess = true;
-                    }
-                }
-
-                if (checkSuccess == false && useProxyAPI == true)
-                {
-                    //request failed using proxy api, request again using local http
-                    checkSuccess = CheckURL(checkUrl, false);
-                }
-            }
-            catch (Exception)
-            {
-                System.Diagnostics.Debug.WriteLine("Failed to check url for access");
-                checkSuccess = false;
-            }
-
-            return checkSuccess;
         }
 
         #endregion Utils

@@ -31,11 +31,19 @@ namespace Certify.UI.Controls
         public ManagedSites()
         {
             InitializeComponent();
+            this.DataContext = MainViewModel;
+        }
 
-            if (!System.ComponentModel.DesignerProperties.GetIsInDesignMode(this))
+        private void UserControl_OnLoaded(object sender, RoutedEventArgs e)
+        {
+            CollectionViewSource.GetDefaultView(lvManagedSites.ItemsSource).Filter = (item) =>
             {
-                this.DataContext = MainViewModel;
-            }
+                string filter = txtFilter.Text.Trim();
+                return filter == "" || filter.Split(';').Where(f => f.Trim() != "").Any(f =>
+                    ((Models.ManagedSite)item).Name.IndexOf(f, StringComparison.OrdinalIgnoreCase) > -1 ||
+                    (((Models.ManagedSite)item).DomainOptions?.Any(d => d.Domain.IndexOf(f, StringComparison.OrdinalIgnoreCase) > -1) ?? false) ||
+                    (((Models.ManagedSite)item).Comments ?? "").IndexOf(f, StringComparison.OrdinalIgnoreCase) > -1);
+            };
         }
 
         private void ListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -69,6 +77,11 @@ namespace Certify.UI.Controls
             {
                 // this.MainViewModel.ManagedSites[0].Name = DateTime.Now.ToShortDateString();
             }
+        }
+
+        private void TxtFilter_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            CollectionViewSource.GetDefaultView(lvManagedSites.ItemsSource).Refresh();
         }
     }
 }

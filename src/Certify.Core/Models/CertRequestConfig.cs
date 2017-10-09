@@ -54,6 +54,12 @@ namespace Certify.Models
         public bool PerformExtensionlessConfigChecks { get; set; }
 
         /// <summary>
+        /// If true, perform an automated check that the web host is configured to respond to
+        /// tls sni requests
+        /// </summary>
+        public bool PerformTlsSniBindingConfigChecks { get; set; }
+
+        /// <summary>
         /// If true, attempt to automatically configure the web host/web aplication as required
         /// </summary>
         public bool PerformAutoConfig { get; set; }
@@ -74,6 +80,31 @@ namespace Certify.Models
         /// In the case of Lets Encrypt, the challenge type this request will use (eg. http-01)
         /// </summary>
         public string ChallengeType { get; set; }
+
+        /// <summary>
+        /// The trigger for the webhook (None, Success, Error)
+        /// </summary>
+        public string WebhookTrigger { get; set; } = Webhook.ON_NONE;
+
+        /// <summary>
+        /// The http method for the webhook request
+        /// </summary>
+        public string WebhookMethod { get; set; }
+
+        /// <summary>
+        /// The http url for the webhook request
+        /// </summary>
+        public string WebhookUrl { get; set; }
+
+        /// <summary>
+        /// The http content type header for the webhook request
+        /// </summary>
+        public string WebhookContentType { get; set; }
+
+        /// <summary>
+        /// The http body template for the webhook request
+        /// </summary>
+        public string WebhookContentBody { get; set; }
 
         /// <summary>
         /// PowerShell script to run before executing certificate request
